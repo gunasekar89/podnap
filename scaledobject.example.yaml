@@ -1,0 +1,43 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: orders-api-sleep-mode
+  namespace: dev
+  labels:
+    app.kubernetes.io/managed-by: sleep-mode
+  annotations:
+    sleepmode/deployment-uid: "example-deployment-uid"
+    sleepmode/service: "orders-api"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orders-api
+  minReplicaCount: 0 # Allow the Deployment to sleep completely.
+  maxReplicaCount: 1 # Captured original replicas, minimum 1, unless overridden.
+  pollingInterval: 15 # Seconds between KEDA's checks while asleep.
+  cooldownPeriod: 1800 # 30 minutes after the last active trigger.
+  initialCooldownPeriod: 1800 # Protect the first idle period after creation (KEDA >= 2.14).
+  advanced:
+    restoreToOriginalReplicaCount: false # disable restores our saved snapshot explicitly.
+  triggers:
+    - type: prometheus
+      name: wake
+      metricType: AverageValue
+      metadata:
+        serverAddress: "http://prometheus.monitoring:9090"
+        # 2m is a sliding, extrapolated request-count estimate, including 503s.
+        query: "sum(increase(nginx_ingress_controller_requests{exported_namespace=\"dev\",service=\"orders-api\",path!~\"/healthz|/readyz|/livez|/health|/ping\"}[2m]))"
+        threshold: "50" # Estimated requests per pod per 2m for HPA scaling (default 50).
+        activationThreshold: "2" # Strictly greater than N-1; approximate 3-hit wake.
+        ignoreNullValues: "false" # Missing metrics are an error, not invented zero traffic.
+    - type: prometheus
+      name: keep-awake
+      metricType: AverageValue
+      metadata:
+        serverAddress: "http://prometheus.monitoring:9090"
+        # Gate on desired replicas > 0 so even one request keeps RUNNING pods awake.
+        query: "sum(increase(nginx_ingress_controller_requests{exported_namespace=\"dev\",service=\"orders-api\",path!~\"/healthz|/readyz|/livez|/health|/ping\"}[2m])) * on() (max(kube_deployment_spec_replicas{namespace=\"dev\",deployment=\"orders-api\"}) > bool 0)"
+        threshold: "50" # Same per-pod target; HPA takes the maximum, not the sum.
+        activationThreshold: "0" # Any measured traffic resets the running workload's cooldown.
+        ignoreNullValues: "false" # Missing kube-state-metrics must not look like zero activity.
